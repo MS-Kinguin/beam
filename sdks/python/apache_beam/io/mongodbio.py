@@ -92,6 +92,8 @@ try:
   from bson import json_util
   from bson import objectid
   from bson.objectid import ObjectId
+  from bson.codec_options import CodecOptions  ## new import
+  from bson.datetime_ms import DatetimeConversion  ## new import
 
   # pymongo also internally depends on bson.
   from pymongo import ASCENDING
@@ -263,6 +265,14 @@ class _BoundedMongoSource(iobase.BoundedSource):
     self.projection = projection
     self.spec = extra_client_params
     self.bucket_auto = bucket_auto
+    self.codec_options = CodecOptions(datetime_conversion=DatetimeConversion.DATETIME_AUTO)
+    """
+    This line sets up the MongoDB client to use DatetimeConversion.DATETIME_AUTO, 
+    which returns a DatetimeMS object if the timestamp is out of the range for 
+    the standard datetime object. Otherwise, it returns a standard datetime object.
+    The codec options were specifically added to the `read` and `_get_head_document_id` methods
+    to ensure the BSON DatetimeMS objects are handled correctly during document retrieval.
+    """
 
   def estimate_size(self):
     with MongoClient(self.uri, **self.spec) as client:
@@ -406,10 +416,11 @@ class _BoundedMongoSource(iobase.BoundedSource):
       an iterator of data read by the source.
     """
     with MongoClient(self.uri, **self.spec) as client:
+      db = client.get_database(self.db, codec_options=self.codec_options)
       all_filters = self._merge_id_filter(
           range_tracker.start_position(), range_tracker.stop_position())
       docs_cursor = (
-          client[self.db][self.coll].find(
+          db[self.coll].find(
               filter=all_filters,
               projection=self.projection).sort([("_id", ASCENDING)]))
       for doc in docs_cursor:
@@ -443,10 +454,10 @@ class _BoundedMongoSource(iobase.BoundedSource):
             (isinstance(start_pos, str) and start_pos >= end_pos))
 
   def _get_split_keys(
-      self,
-      desired_chunk_size_in_mb: int,
-      start_pos: Union[int, str, ObjectId],
-      end_pos: Union[int, str, ObjectId],
+          self,
+          desired_chunk_size_in_mb: int,
+          start_pos: Union[int, str, ObjectId],
+          end_pos: Union[int, str, ObjectId],
   ):
     """Calls MongoDB `splitVector` command
     to get document ids at split position.
@@ -467,11 +478,11 @@ class _BoundedMongoSource(iobase.BoundedSource):
       )["splitKeys"]
 
   def _get_auto_buckets(
-      self,
-      desired_chunk_size_in_mb: int,
-      start_pos: Union[int, str, ObjectId],
-      end_pos: Union[int, str, ObjectId],
-      is_initial_split: bool,
+          self,
+          desired_chunk_size_in_mb: int,
+          start_pos: Union[int, str, ObjectId],
+          end_pos: Union[int, str, ObjectId],
+          is_initial_split: bool,
   ) -> list:
     """Use MongoDB `$bucketAuto` aggregation to split collection into bundles
     instead of `splitVector` command, which does not work with MongoDB Atlas.
@@ -496,19 +507,19 @@ class _BoundedMongoSource(iobase.BoundedSource):
     bucket_count = math.ceil(size_in_mb / desired_chunk_size_in_mb)
     with beam.io.mongodbio.MongoClient(self.uri, **self.spec) as client:
       pipeline = [
-          {
-              # filter by positions and by the custom filter if any
-              "$match": self._merge_id_filter(start_pos, end_pos)
-          },
-          {
-              "$bucketAuto": {
-                  "groupBy": "$_id", "buckets": bucket_count
-              }
-          },
+        {
+          # filter by positions and by the custom filter if any
+          "$match": self._merge_id_filter(start_pos, end_pos)
+        },
+        {
+          "$bucketAuto": {
+            "groupBy": "$_id", "buckets": bucket_count
+          }
+        },
       ]
       buckets = list(
-          # Use `allowDiskUse` option to avoid aggregation limit of 100 Mb RAM
-          client[self.db][self.coll].aggregate(pipeline, allowDiskUse=True))
+        # Use `allowDiskUse` option to avoid aggregation limit of 100 Mb RAM
+        client[self.db][self.coll].aggregate(pipeline, allowDiskUse=True))
       if buckets:
         buckets[-1]["_id"]["max"] = end_pos
 
@@ -546,8 +557,9 @@ class _BoundedMongoSource(iobase.BoundedSource):
 
   def _get_head_document_id(self, sort_order):
     with MongoClient(self.uri, **self.spec) as client:
+      db = client.get_database(self.db, codec_options=self.codec_options)
       cursor = (
-          client[self.db][self.coll].find(filter={}, projection=[]).sort([
+          db[self.coll].find(filter={}, projection=[]).sort([
               ("_id", sort_order)
           ]).limit(1))
       try:
